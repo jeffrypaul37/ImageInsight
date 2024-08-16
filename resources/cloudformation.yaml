@@ -1,0 +1,263 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Extracting text and analyzing images using Amazon Textract and Amazon Rekognition services
+
+Parameters:
+  RoleArn:
+    Description: Existing IAM role ARN
+    Type: String
+    Default: arn:aws:iam::880211722320:role/LabRole
+
+  BucketName:
+    Description: Name of the S3 bucket
+    Type: String
+
+Resources:
+  TextractLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: textract_lambda.lambda_handler
+      Role: !Ref RoleArn
+      Code:
+        S3Bucket: !Ref BucketName
+        S3Key: textract_lambda.zip
+      Runtime: python3.8
+      Timeout: 60
+
+  RekognitionLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: rekognition_lambda.lambda_handler
+      Role: !Ref RoleArn
+      Code:
+        S3Bucket: !Ref BucketName
+        S3Key: rekognition_lambda.zip
+      Runtime: python3.8
+      Timeout: 60
+
+  TextractLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt TextractLambdaFunction.Arn
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub "arn:aws:s3:::${BucketName}"
+
+  RekognitionLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt RekognitionLambdaFunction.Arn
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub "arn:aws:s3:::${BucketName}"
+
+  TextractApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: TextractApi
+
+  RekognitionApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: RekognitionApi
+
+  InputBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: !Sub '${AWS::StackName}-${AWS::Region}-${AWS::AccountId}'
+        CorsConfiguration:
+          CorsRules:
+          - AllowedHeaders:
+            - "*"
+            AllowedMethods:
+            - PUT
+            - POST
+            - GET
+            AllowedOrigins:
+            - "*"
+
+  TextractApiGatewayResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref TextractApiGateway
+      ParentId: !GetAtt TextractApiGateway.RootResourceId
+      PathPart: 'extract'
+
+  RekognitionApiGatewayResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RekognitionApiGateway
+      ParentId: !GetAtt RekognitionApiGateway.RootResourceId
+      PathPart: 'recognize'
+
+  TextractApiGatewayMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      ApiKeyRequired: false
+      RequestParameters:
+          method.request.header.Content-Type: false
+          method.request.path.filename: true
+      HttpMethod: POST
+      ResourceId: !Ref TextractApiGatewayResource
+      RestApiId: !Ref TextractApiGateway
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${TextractLambdaFunction.Arn}/invocations"
+        IntegrationResponses:
+             - StatusCode: 200
+               ResponseParameters:
+                   method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+          - StatusCode: 200
+            ResponseParameters:
+                method.response.header.Access-Control-Allow-Origin: true
+
+  RekognitionApiGatewayMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      ApiKeyRequired: false
+      RequestParameters:
+          method.request.header.Content-Type: false
+          method.request.path.filename: true
+      HttpMethod: POST
+      ResourceId: !Ref RekognitionApiGatewayResource
+      RestApiId: !Ref RekognitionApiGateway
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${RekognitionLambdaFunction.Arn}/invocations"
+        IntegrationResponses:
+             - StatusCode: 200
+               ResponseParameters:
+                   method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+          - StatusCode: 200
+            ResponseParameters:
+                method.response.header.Access-Control-Allow-Origin: true
+
+  TextractApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: TextractApiGatewayMethod
+    Properties:
+      RestApiId: !Ref TextractApiGateway
+      StageName: prod
+
+  RekognitionApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: RekognitionApiGatewayMethod
+    Properties:
+      RestApiId: !Ref RekognitionApiGateway
+      StageName: prod
+
+  TextractLambdaApiPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref TextractLambdaFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: 
+        Fn::Sub: arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${TextractApiGateway}/*/POST/extract
+
+  RekognitionLambdaApiPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref RekognitionLambdaFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: 
+        Fn::Sub: arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RekognitionApiGateway}/*/POST/recognize
+
+  Frontend:
+        Type: AWS::EC2::Instance
+        DependsOn:
+            - UploadUrlParameter
+            - RecognizeUrlParameter
+            - InputBucketNameParameter
+            - EC2SecurityGroup
+        Properties:
+            ImageId: ami-0b72821e2f351e396
+            InstanceType: t2.micro
+            KeyName: TestKey
+            IamInstanceProfile: !Ref FrontendProfile
+            SecurityGroupIds:
+                - !Ref EC2SecurityGroup
+            UserData:
+                Fn::Base64: !Sub |
+                    #!/bin/bash -xe
+                    exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+                    yum update -y
+                    yum install -y aws-cli
+                    NEXT_PUBLIC_EXTRACT_URL=$(aws ssm get-parameter --name ExtractUrl --query 'Parameter.Value' --output text)
+                    echo "export NEXT_PUBLIC_EXTRACT_URL=$NEXT_PUBLIC_EXTRACT_URL" >> /etc/environment
+                    source /etc/environment
+                    NEXT_PUBLIC_RECOGNIZE_URL=$(aws ssm get-parameter --name RecognizeUrl --query 'Parameter.Value' --output text)
+                    echo "export NEXT_PUBLIC_RECOGNIZE_URL=$NEXT_PUBLIC_RECOGNIZE_URL" >> /etc/environment
+                    source /etc/environment
+                    NEXT_PUBLIC_BUCKET_NAME=$(aws ssm get-parameter --name InputBucketName --query 'Parameter.Value' --output text)
+                    echo "export NEXT_PUBLIC_BUCKET_NAME=$NEXT_PUBLIC_BUCKET_NAME" >> /etc/environment
+                    source /etc/environment
+                    aws s3 cp s3://textract-rekognition-bucket/pre-signed-put-url-main.zip /home/ec2-user/
+                    yum install -y unzip
+                    unzip /home/ec2-user/pre-signed-put-url-main.zip -d /home/ec2-user/
+                    curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.5/install.sh | bash
+                    export NVM_DIR="$HOME/.nvm"
+                    [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh" 
+                    nvm install node
+                    npm install -g pm2
+                    chmod +x /home/ec2-user/pre-signed-put-url-main/node_modules/.bin/next
+                    npm cache clean --force
+                    cd /home/ec2-user/pre-signed-put-url-main
+                    npm install
+                    npm run build
+                    pm2 start npm --name "next-app" -- start
+
+  EC2SecurityGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+          GroupDescription: 'EC2 security group'
+          SecurityGroupIngress:
+              - IpProtocol: '-1'
+                CidrIp: '0.0.0.0/0'
+
+  FrontendProfile:
+      Type: AWS::IAM::InstanceProfile
+      Properties:
+          Roles:
+              - "LabRole"                      
+
+  UploadUrlParameter:
+      Type: AWS::SSM::Parameter
+      DependsOn: TextractApiGatewayDeployment
+      Properties:
+          Name: ExtractUrl
+          Type: String
+          Value: !Sub "https://${TextractApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod/extract"
+
+  RecognizeUrlParameter:
+      Type: AWS::SSM::Parameter
+      DependsOn: RekognitionApiGatewayDeployment
+      Properties:
+          Name: RecognizeUrl
+          Type: String
+          Value: !Sub "https://${RekognitionApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod/recognize"
+
+  InputBucketNameParameter:
+      Type: AWS::SSM::Parameter
+      DependsOn: InputBucket
+      Properties:
+          Name: InputBucketName
+          Type: String
+          Value: !Ref InputBucket
+ 
+Outputs:
+  TextractApiEndpoint:
+    Description: "Textract API Gateway endpoint URL"
+    Value: !Sub "https://${TextractApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod/extract"
+
+  RekognitionApiEndpoint:
+    Description: "Rekognition API Gateway endpoint URL"
+    Value: !Sub "https://${RekognitionApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod/recognize"
+
+
